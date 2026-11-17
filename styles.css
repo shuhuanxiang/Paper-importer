@@ -1,8 +1,22 @@
-/*
+.paper-importer-modal .setting-item-control {
+	flex-wrap: wrap;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.paper-importer-modal textarea {
+	min-width: min(28rem, 60vw);
+	min-height: 3rem;
+	resize: vertical;
+}
 
-If your plugin does not need CSS, delete this file.
+.modal.paper-importer-modal {
+	width: min(48rem, calc(100vw - 2rem));
+	max-height: min(85vh, 60rem);
+}
 
-*/
+.paper-importer-conflict-description {
+	color: var(--text-muted);
+}
+
+.paper-importer-library-input {
+	display: none;
+}

@@ -1,114 +1,135 @@
-import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-} from 'obsidian';
-import {
-	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
-} from './settings';
+import { Menu, Notice, Plugin, TFile } from 'obsidian';
+import { DEFAULT_SETTINGS, PaperImporterSettingTab } from './settings';
+import { PaperImportService, ImportMode } from './importer';
+import { ImportCancelledError } from './utils/tasks';
+import { PaperImporterSettings } from './types';
+import { getUiLocale, uiStrings } from './i18n';
+import { JournalRankingService } from './journal/service';
 
-// Remember to rename these classes and interfaces!
+export default class PaperImporterPlugin extends Plugin {
+	settings!: PaperImporterSettings;
+	journalRankings!: JournalRankingService;
+	private importService!: PaperImportService;
+	private activeController: AbortController | undefined;
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
-
-	async onload() {
+	async onload(): Promise<void> {
 		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			},
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
+		const text = uiStrings();
+		this.journalRankings = new JournalRankingService(
+			this.app.vault.adapter,
+			this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
 		);
+		this.importService = new PaperImportService(this.app, () => this.settings, this.journalRankings);
+
+		this.addRibbonIcon('file-input', text.ribbonImport, () => {
+			const file = this.activePdf();
+			if (file) void this.startImport(file, 'combined');
+			else new Notice(text.noActivePdf);
+		});
+
+		this.addCommand({
+			id: 'parse-current-pdf',
+			name: text.commandParse,
+			checkCallback: (checking) => this.withActivePdf(checking, 'parse'),
+		});
+		this.addCommand({
+			id: 'fetch-current-pdf-metadata',
+			name: text.commandMetadata,
+			checkCallback: (checking) => this.withActivePdf(checking, 'metadata'),
+		});
+		this.addCommand({
+			id: 'import-current-pdf',
+			name: text.commandCombined,
+			checkCallback: (checking) => this.withActivePdf(checking, 'combined'),
+		});
+		this.addCommand({
+			id: 'cancel-active-import',
+			name: text.commandCancel,
+			checkCallback: (checking) => {
+				if (!this.activeController) return false;
+				if (!checking) this.activeController.abort();
+				return true;
+			},
+		});
+
+		this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
+			if (!(file instanceof TFile) || file.extension.toLowerCase() !== 'pdf') return;
+			this.addPdfMenuItems(menu, file);
+		}));
+		this.addSettingTab(new PaperImporterSettingTab(this.app, this));
 	}
 
-	onunload() {}
+	onunload(): void {
+		this.activeController?.abort();
+	}
 
-	async loadSettings() {
+	async loadSettings(): Promise<void> {
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
+			(await this.loadData()) as Partial<PaperImporterSettings>,
 		);
 	}
 
-	async saveSettings() {
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
+	private activePdf(): TFile | null {
+		const file = this.app.workspace.getActiveFile();
+		return file?.extension.toLowerCase() === 'pdf' ? file : null;
 	}
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
+	private withActivePdf(checking: boolean, mode: ImportMode): boolean {
+		const file = this.activePdf();
+		if (!file) return false;
+		if (!checking) void this.startImport(file, mode);
+		return true;
+	}
+
+	private addPdfMenuItems(menu: Menu, file: TFile): void {
+		menu.addItem((item) => item
+			.setTitle(uiStrings().menuParse)
+			.setIcon('file-text')
+			.onClick(() => void this.startImport(file, 'parse')));
+		menu.addItem((item) => item
+			.setTitle(uiStrings().menuMetadata)
+			.setIcon('database')
+			.onClick(() => void this.startImport(file, 'metadata')));
+		menu.addItem((item) => item
+			.setTitle(uiStrings().menuCombined)
+			.setIcon('combine')
+			.onClick(() => void this.startImport(file, 'combined')));
+	}
+
+	private async startImport(file: TFile, mode: ImportMode): Promise<void> {
+		const text = uiStrings();
+		if (this.activeController) {
+			new Notice(text.importRunning);
+			return;
+		}
+		const controller = new AbortController();
+		this.activeController = controller;
+		const progress = new Notice(text.importPreparing, 0);
+		try {
+			const result = await this.importService.run(file, mode, (message) => progress.setMessage(message), controller.signal);
+			progress.hide();
+			if (!result) {
+				new Notice(text.importCancelled);
+				return;
+			}
+			new Notice(text.importSaved(result.notePath), 7000);
+			if (result.warnings.length) new Notice(text.importWarnings(result.warnings.join(getUiLocale() === 'zh' ? '；' : '; ')), 10000);
+		} catch (error) {
+			progress.hide();
+			if (error instanceof ImportCancelledError) {
+				new Notice(text.importCancelled);
+				return;
+			}
+			const message = error instanceof Error ? error.message : text.unknownError;
+			new Notice(text.importFailed(message), 10000);
+		} finally {
+			if (this.activeController === controller) this.activeController = undefined;
+		}
 	}
 }
